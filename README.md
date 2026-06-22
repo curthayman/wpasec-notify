@@ -4,15 +4,15 @@ A lightweight daemon that polls your [wpa-sec.stanev.org](https://wpa-sec.stanev
 
 ## Features
 
-- **Rich Discord embeds** — each crack gets its own embed with SSID, BSSID, password, router vendor, and password type
-- **IEEE OUI vendor lookup** — identifies the router manufacturer from the MAC address using the official IEEE database (auto-refreshes weekly, no API key required)
-- **Password analysis** — categorizes passwords as numeric-only, common/default, has special chars, etc., with color-coded embeds
-- **Randomized MAC detection** — correctly identifies locally administered / randomized MAC addresses
-- **Milestone notifications** — gold trophy embeds at 10, 25, 50, 100, 200, 500, and 1000 total cracks
-- **Daily digest** — summary embed every morning with total cracked, average password length, and password type breakdown
-- **CSV export** — every new crack is appended to `cracks.csv` with timestamp, vendor, and password type
-- **Log rotation** — log file capped at 1 MB with 3 backups
-- **No external dependencies** — pure Python standard library
+- **Rich Discord embeds** - each crack gets its own embed with SSID, BSSID, password, router vendor, and password type
+- **IEEE OUI vendor lookup** - identifies the router manufacturer from the MAC address using the official IEEE database (auto-refreshes weekly, no API key required)
+- **Password analysis** - categorizes passwords as numeric-only, common/default, has special chars, etc., with color-coded embeds
+- **Randomized MAC detection** - correctly identifies locally administered / randomized MAC addresses
+- **Milestone notifications** - gold trophy embeds at 10, 25, 50, 100, 200, 500, and 1000 total cracks
+- **Daily digest** - summary embed every morning with total cracked, average password length, and password type breakdown
+- **CSV export** - every new crack is appended to `cracks.csv` with timestamp, vendor, and password type
+- **Log rotation** - log file capped at 1 MB with 3 backups
+- **No external dependencies** - pure Python standard library
 
 ## Setup
 
@@ -35,9 +35,9 @@ DISCORD_WEBHOOK=https://discord.com/api/webhooks/your/webhook/here
 POLL_INTERVAL=30
 ```
 
-- **WPASEC_KEY** — found on your [wpa-sec.stanev.org](https://wpa-sec.stanev.org) profile page
-- **DISCORD_WEBHOOK** — create one under your Discord server's channel settings → Integrations → Webhooks
-- **POLL_INTERVAL** — how often to check for new cracks, in minutes (default: 30)
+- **WPASEC_KEY** - found on your [wpa-sec.stanev.org](https://wpa-sec.stanev.org) profile page
+- **DISCORD_WEBHOOK** - create one under your Discord server's channel settings → Integrations → Webhooks
+- **POLL_INTERVAL** - how often to check for new cracks, in minutes (default: 30)
 
 **3. Make `run.sh` executable:**
 ```bash
@@ -84,7 +84,7 @@ Each cracked network fires an embed showing:
 | Router Vendor | `TP-Link Corporation Limited` |
 | Password Type | `Alphanumeric` |
 
-Embed color reflects password strength — red for weak/short/common, orange for letters-only, green for alphanumeric or special chars.
+Embed color reflects password strength - red for weak/short/common, orange for letters-only, green for alphanumeric or special chars.
 
 ### Milestone
 Gold embed when your total crack count hits 10, 25, 50, 100, 200, 500, or 1000.

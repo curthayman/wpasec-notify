@@ -1,0 +1,10 @@
+config.env
+*.log
+*.csv
+*.potfile
+oui_db.json
+seen_cracks.json
+seen_cracks.json.bak
+state.json
+.idea/
+.claude/

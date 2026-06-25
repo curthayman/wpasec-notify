@@ -30,8 +30,9 @@ STATE_FILE  = SCRIPT_DIR / "state.json"
 OUI_DB_FILE = SCRIPT_DIR / "oui_db.json"
 CSV_FILE    = SCRIPT_DIR / "cracks.csv"
 LOG_FILE    = SCRIPT_DIR / "wpasec.log"
-POT_URL     = "https://wpa-sec.stanev.org/?api&dl=1"
-OUI_CSV_URL = "https://standards-oui.ieee.org/oui/oui.csv"
+POT_URL      = "https://wpa-sec.stanev.org/?api&dl=1"
+MY_NETS_URL  = "https://wpa-sec.stanev.org/?my_nets"
+OUI_CSV_URL  = "https://standards-oui.ieee.org/oui/oui.csv"
 OUI_REFRESH_DAYS = 7
 
 MILESTONES = {10, 25, 50, 100, 200, 500, 1000}
@@ -43,12 +44,15 @@ COLOR_ORANGE   = 0xFFA500   # letters-only password
 COLOR_STRONG   = 0x00CC44   # password with special chars
 COLOR_GOLD     = 0xFFD700   # milestone
 COLOR_BLURPLE  = 0x5865F2   # daily digest
+COLOR_TEAL     = 0x00B4D8   # new handshake upload
 # ──────────────────────────────────────────────────────────────────────────────
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 def _setup_logging() -> logging.Logger:
     _logger = logging.getLogger("wpasec")
+    if _logger.handlers:
+        return _logger
     _logger.setLevel(logging.INFO)
     fmt = logging.Formatter("[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
@@ -56,12 +60,7 @@ def _setup_logging() -> logging.Logger:
         LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
     )
     fh.setFormatter(fmt)
-
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(fmt)
-
     _logger.addHandler(fh)
-    _logger.addHandler(ch)
     return _logger
 
 logger = _setup_logging()
@@ -88,7 +87,7 @@ def load_state() -> dict:
             return json.loads(STATE_FILE.read_text())
         except (json.JSONDecodeError, ValueError):
             pass
-    return {"milestones_hit": [], "last_digest_date": None}
+    return {"milestones_hit": [], "last_digest_date": None, "last_submission_ts": None}
 
 
 def save_state(state: dict) -> None:
@@ -151,6 +150,40 @@ def parse_pot(raw: str) -> list[dict]:
                 "password": parts[3].strip(),
             })
     return entries
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+# ── My Networks (submission tracking) ────────────────────────────────────────
+def fetch_my_nets() -> str:
+    req = urllib.request.Request(MY_NETS_URL, headers={
+        "User-Agent": "wpasec-notify/2.0",
+        "Cookie": f"key={WPASEC_KEY}",
+    })
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+def parse_my_nets(html: str) -> list[dict]:
+    """Return list of {bssid, ssid, type, timestamp} from My Networks page, newest first."""
+    results = []
+    for row in re.finditer(r'<tr[^>]*>(.*?)</tr>', html, re.DOTALL | re.IGNORECASE):
+        row_html = row.group(1)
+        if '<th' in row_html:
+            continue
+        cells = re.findall(r'<td[^>]*>(.*?)</td>', row_html, re.DOTALL | re.IGNORECASE)
+        if len(cells) < 5:
+            continue
+        bssid_m = re.search(r'([0-9a-f]{12})', cells[1], re.IGNORECASE)
+        if not bssid_m:
+            continue
+        raw = bssid_m.group(1).lower()
+        bssid = ':'.join(raw[i:i+2] for i in range(0, 12, 2))
+        ssid = re.sub(r'<[^>]+>', '', cells[2]).strip()
+        net_type = re.sub(r'<[^>]+>', '', cells[3]).strip()
+        ts = re.sub(r'<[^>]+>', '', cells[-1]).strip()
+        if re.match(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}', ts):
+            results.append({'bssid': bssid, 'ssid': ssid, 'type': net_type, 'timestamp': ts})
+    return results
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -307,6 +340,23 @@ def send_discord_daily_digest(entries: list[dict]) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+def send_discord_new_submission(new_nets: list[dict]) -> None:
+    count = len(new_nets)
+    lines = [
+        f"`{n['bssid']}` — **{n['ssid']}** ({n['type']}) @ {n['timestamp']}"
+        for n in new_nets[:10]
+    ]
+    if count > 10:
+        lines.append(f"... and {count - 10} more")
+    _post_discord({"embeds": [{
+        "title": f"\U0001f4e1 {count} New Handshake{'s' if count > 1 else ''} Uploaded to wpa-sec",
+        "color": COLOR_TEAL,
+        "description": "\n".join(lines),
+        "timestamp": _utcnow_iso(),
+    }]})
+# ──────────────────────────────────────────────────────────────────────────────
+
+
 # ── Stats (--stats mode) ──────────────────────────────────────────────────────
 def print_stats(entries: list[dict]) -> None:
     sep = "─" * 52
@@ -376,7 +426,7 @@ def check(oui_db: dict, dry_run: bool = False) -> None:
             seen.add(f"{e['mac1']}:{e['mac2']}")
         save_cache(seen)
     else:
-        logger.info("No new cracks since last check.")
+        logger.debug("No new cracks since last check.")
 
     # ── Milestones ─────────────────────────────────────────────────────────────
     milestones_hit = set(state.get("milestones_hit", []))
@@ -402,6 +452,28 @@ def check(oui_db: dict, dry_run: bool = False) -> None:
             except Exception as exc:
                 logger.error(f"ERROR sending daily digest: {exc}")
         state["last_digest_date"] = today_str
+
+    # ── Submission tracking ────────────────────────────────────────────────────
+    try:
+        nets = parse_my_nets(fetch_my_nets())
+        if nets:
+            newest_ts = nets[0]['timestamp']
+            last_sub_ts = state.get('last_submission_ts')
+            if last_sub_ts is None:
+                state['last_submission_ts'] = newest_ts
+                logger.info(f"Initialized submission tracker (newest: {newest_ts}).")
+            elif newest_ts > last_sub_ts:
+                new_nets = [n for n in nets if n['timestamp'] > last_sub_ts]
+                logger.info(f"Found {len(new_nets)} new submission(s).")
+                if not dry_run:
+                    try:
+                        send_discord_new_submission(new_nets)
+                        logger.info("Submission notification sent.")
+                    except Exception as exc:
+                        logger.error(f"ERROR sending submission notification: {exc}")
+                state['last_submission_ts'] = newest_ts
+    except Exception as exc:
+        logger.error(f"ERROR checking submissions: {exc}")
 
     save_state(state)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -457,7 +529,7 @@ def main() -> None:
     try:
         while True:
             check(oui_db)
-            logger.info(f"Sleeping {POLL_INTERVAL // 60} minutes...")
+            logger.debug(f"Sleeping {POLL_INTERVAL // 60} minutes...")
             time.sleep(POLL_INTERVAL)
     except KeyboardInterrupt:
         logger.info("Stopped.")

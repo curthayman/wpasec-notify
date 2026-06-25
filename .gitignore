@@ -1,4 +1,5 @@
 config.env
+CLAUDE.md
 *.log
 *.csv
 *.potfile

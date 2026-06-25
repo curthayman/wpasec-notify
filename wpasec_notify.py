@@ -7,6 +7,7 @@ exports to CSV, posts a daily digest, and performs MAC vendor + password analysi
 
 import argparse
 import csv
+import fcntl
 import json
 import logging
 import logging.handlers
@@ -64,6 +65,21 @@ def _setup_logging() -> logging.Logger:
     return _logger
 
 logger = _setup_logging()
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+# ── Instance lock (prevents duplicate notifications from two running daemons) ─
+_lock_fd = None
+
+def _acquire_instance_lock() -> None:
+    global _lock_fd
+    lock_path = SCRIPT_DIR / "wpasec.lock"
+    _lock_fd = open(lock_path, "w")
+    try:
+        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("ERROR: Another instance of wpasec-notify is already running.", file=sys.stderr)
+        sys.exit(1)
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -518,6 +534,8 @@ def main() -> None:
             logger.error(f"ERROR: {exc}")
             sys.exit(1)
         sys.exit(0)
+
+    _acquire_instance_lock()
 
     logger.info(f"Starting wpa-sec notifier (polling every {POLL_INTERVAL // 60} minutes).")
     logger.info(f"Cache: {CACHE_FILE}  |  CSV: {CSV_FILE}  |  Log: {LOG_FILE}")

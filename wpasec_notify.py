@@ -11,13 +11,14 @@ import fcntl
 import json
 import logging
 import logging.handlers
+import math
 import os
 import re
 import sys
 import time
 import urllib.request
 import urllib.error
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timezone, timedelta
 from pathlib import Path
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -46,11 +47,13 @@ COLOR_STRONG   = 0x00CC44   # password with special chars
 COLOR_GOLD     = 0xFFD700   # milestone
 COLOR_BLURPLE  = 0x5865F2   # daily digest
 COLOR_TEAL     = 0x00B4D8   # new handshake upload
+COLOR_ISP      = 0xFF6B35   # ISP/router default SSID
+COLOR_MULTI    = 0x9B59B6   # same SSID on multiple APs
 # ──────────────────────────────────────────────────────────────────────────────
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
-def _setup_logging() -> logging.Logger:
+def _setup_logging(stdout: bool = False) -> logging.Logger:
     _logger = logging.getLogger("wpasec")
     if _logger.handlers:
         return _logger
@@ -62,6 +65,12 @@ def _setup_logging() -> logging.Logger:
     )
     fh.setFormatter(fmt)
     _logger.addHandler(fh)
+
+    if stdout:
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(fmt)
+        _logger.addHandler(sh)
+
     return _logger
 
 logger = _setup_logging()
@@ -103,7 +112,13 @@ def load_state() -> dict:
             return json.loads(STATE_FILE.read_text())
         except (json.JSONDecodeError, ValueError):
             pass
-    return {"milestones_hit": [], "last_digest_date": None, "last_submission_ts": None}
+    return {
+        "milestones_hit": [],
+        "last_digest_date": None,
+        "last_submission_ts": None,
+        "daily_crack_counts": {},
+        "notified_multi_ap_ssids": [],
+    }
 
 
 def save_state(state: dict) -> None:
@@ -215,6 +230,21 @@ def get_vendor(mac: str, oui_db: dict) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+# ── ISP Default SSID Detection ───────────────────────────────────────────────
+_ISP_SSID_RE = re.compile(
+    r'^(NETGEAR|xfinit|ATT-|ATT[0-9]|Linksys|TP-LINK_|SPECTRUM|DIRECT-|'
+    r'Fios-|CenturyLink|Verizon-|FRITZ!Box|HUAWEI-|D-Link|dlink-|BT-Hub|'
+    r'Sky[0-9A-Z-]|virginmedia|TalkTalk|EE-[A-Z]|BELL[0-9]|ROGERS[0-9]|'
+    r'ASUS_|Cox[A-Z0-9]|HOME-[0-9]|default)',
+    re.IGNORECASE,
+)
+
+
+def is_isp_default(ssid: str) -> bool:
+    return bool(_ISP_SSID_RE.match(ssid))
+# ──────────────────────────────────────────────────────────────────────────────
+
+
 # ── Password Analysis ─────────────────────────────────────────────────────────
 _COMMON_PASSWORDS = {
     "12345678", "123456789", "1234567890", "0987654321",
@@ -242,6 +272,18 @@ def analyze_password(pw: str) -> tuple[str, int]:
     if re.fullmatch(r"[a-zA-Z]+", pw):
         return ("Letters only", COLOR_ORANGE)
     return ("Alphanumeric", COLOR_GREEN)
+
+
+def shannon_entropy(pw: str) -> float:
+    """Total Shannon entropy of the password string in bits."""
+    if not pw:
+        return 0.0
+    n = len(pw)
+    freq: dict[str, int] = {}
+    for c in pw:
+        freq[c] = freq.get(c, 0) + 1
+    per_char = -sum((cnt / n) * math.log2(cnt / n) for cnt in freq.values())
+    return per_char * n
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -294,15 +336,21 @@ def send_discord_new_cracks(new_entries: list[dict], total: int) -> None:
     embeds = []
     for e in new_entries:
         pw_type, color = analyze_password(e["password"])
+        isp = is_isp_default(e["ssid"])
+        if isp:
+            color = COLOR_ISP
+        entropy = shannon_entropy(e["password"])
+        title = f"{'[ISP Default] ' if isp else ''}New Crack: {e['ssid']}"
         embeds.append({
-            "title": f"New Crack: {e['ssid']}",
+            "title": title,
             "color": color,
             "fields": [
-                {"name": "SSID",          "value": f"`{e['ssid']}`",     "inline": True},
-                {"name": "BSSID",         "value": f"`{e['mac1']}`",     "inline": True},
-                {"name": "Password",      "value": f"`{e['password']}`", "inline": False},
+                {"name": "SSID",          "value": f"`{e['ssid']}`",      "inline": True},
+                {"name": "BSSID",         "value": f"`{e['mac1']}`",      "inline": True},
+                {"name": "Password",      "value": f"`{e['password']}`",  "inline": False},
                 {"name": "Router Vendor", "value": e.get("vendor", "Unknown"), "inline": True},
-                {"name": "Password Type", "value": pw_type,              "inline": True},
+                {"name": "Password Type", "value": pw_type,               "inline": True},
+                {"name": "Entropy",       "value": f"{entropy:.1f} bits", "inline": True},
             ],
             "footer": {"text": f"Total cracked: {total}"},
             "timestamp": _utcnow_iso(),
@@ -325,9 +373,11 @@ def send_discord_milestone(milestone: int, total: int) -> None:
     }]})
 
 
-def send_discord_daily_digest(entries: list[dict]) -> None:
+def send_discord_daily_digest(entries: list[dict], daily_counts: dict = None) -> None:
     if not entries:
         return
+    if daily_counts is None:
+        daily_counts = {}
 
     type_counts: dict[str, int] = {}
     lengths = []
@@ -342,12 +392,26 @@ def send_discord_daily_digest(entries: list[dict]) -> None:
         for t, c in sorted(type_counts.items(), key=lambda x: -x[1])
     )
 
+    today_str     = date.today().isoformat()
+    yesterday_str = (date.today() - timedelta(days=1)).isoformat()
+    today_n    = daily_counts.get(today_str, 0)
+    yesterday_n = daily_counts.get(yesterday_str, 0)
+    if yesterday_n == 0:
+        trend = "—"
+    elif today_n > yesterday_n:
+        trend = f"↑ +{today_n - yesterday_n} vs yesterday"
+    elif today_n < yesterday_n:
+        trend = f"↓ -{yesterday_n - today_n} vs yesterday"
+    else:
+        trend = "→ same as yesterday"
+
     _post_discord({"embeds": [{
         "title": "\U0001f4ca Daily wpa-sec Digest",
         "color": COLOR_BLURPLE,
         "fields": [
             {"name": "Total Cracked",       "value": str(len(entries)), "inline": True},
             {"name": "Avg Password Length", "value": f"{avg_len:.1f} chars", "inline": True},
+            {"name": "New Today",           "value": f"{today_n} ({trend})", "inline": True},
             {"name": "Password Breakdown",  "value": breakdown or "—", "inline": False},
         ],
         "footer": {"text": date.today().isoformat()},
@@ -368,6 +432,21 @@ def send_discord_new_submission(new_nets: list[dict]) -> None:
         "title": f"\U0001f4e1 {count} New Handshake{'s' if count > 1 else ''} Uploaded to wpa-sec",
         "color": COLOR_TEAL,
         "description": "\n".join(lines),
+        "timestamp": _utcnow_iso(),
+    }]})
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def send_discord_multi_ap(alerts: list[dict]) -> None:
+    lines = []
+    for a in alerts:
+        bssids = ", ".join(f"`{b}`" for b in a["bssids"])
+        lines.append(f"**{a['ssid']}** — {len(a['bssids'])} APs: {bssids}")
+    _post_discord({"embeds": [{
+        "title": f"\U0001f5fa️ Multi-AP Network{'s' if len(alerts) > 1 else ''} Detected",
+        "color": COLOR_MULTI,
+        "description": "\n".join(lines),
+        "footer": {"text": "Same SSID cracked across multiple BSSIDs"},
         "timestamp": _utcnow_iso(),
     }]})
 # ──────────────────────────────────────────────────────────────────────────────
@@ -441,6 +520,40 @@ def check(oui_db: dict, dry_run: bool = False) -> None:
         for e in new_entries:
             seen.add(f"{e['mac1']}:{e['mac2']}")
         save_cache(seen)
+
+        # ── Crack velocity ─────────────────────────────────────────────────────
+        today_str = date.today().isoformat()
+        daily_counts = state.get("daily_crack_counts", {})
+        daily_counts[today_str] = daily_counts.get(today_str, 0) + len(new_entries)
+        cutoff = (date.today() - timedelta(days=30)).isoformat()
+        state["daily_crack_counts"] = {k: v for k, v in daily_counts.items() if k >= cutoff}
+
+        # ── Multi-AP detection ─────────────────────────────────────────────────
+        ssid_to_macs: dict[str, set[str]] = {}
+        for e in entries:
+            ssid_to_macs.setdefault(e["ssid"], set()).add(e["mac1"])
+
+        notified_multi = set(state.get("notified_multi_ap_ssids", []))
+        multi_ap_alerts = []
+        for e in new_entries:
+            ssid = e["ssid"]
+            if ssid not in notified_multi and len(ssid_to_macs.get(ssid, [])) >= 2:
+                notified_multi.add(ssid)
+                multi_ap_alerts.append({
+                    "ssid": ssid,
+                    "bssids": sorted(ssid_to_macs[ssid]),
+                    "password": e["password"],
+                })
+        state["notified_multi_ap_ssids"] = sorted(notified_multi)
+
+        if multi_ap_alerts:
+            logger.info(f"Multi-AP SSIDs detected: {[a['ssid'] for a in multi_ap_alerts]}")
+            if not dry_run:
+                try:
+                    send_discord_multi_ap(multi_ap_alerts)
+                    logger.info("Multi-AP notification sent.")
+                except Exception as exc:
+                    logger.error(f"ERROR sending multi-AP notification: {exc}")
     else:
         logger.debug("No new cracks since last check.")
 
@@ -458,16 +571,16 @@ def check(oui_db: dict, dry_run: bool = False) -> None:
     state["milestones_hit"] = sorted(milestones_hit)
 
     # ── Daily digest (first poll of each new calendar day) ─────────────────────
-    today_str = date.today().isoformat()
-    if state.get("last_digest_date") != today_str:
+    digest_today = date.today().isoformat()
+    if state.get("last_digest_date") != digest_today:
         logger.info("New day — sending daily digest...")
         if not dry_run:
             try:
-                send_discord_daily_digest(entries)
+                send_discord_daily_digest(entries, state.get("daily_crack_counts", {}))
                 logger.info("Daily digest sent.")
             except Exception as exc:
                 logger.error(f"ERROR sending daily digest: {exc}")
-        state["last_digest_date"] = today_str
+        state["last_digest_date"] = digest_today
 
     # ── Submission tracking ────────────────────────────────────────────────────
     try:
@@ -503,6 +616,8 @@ def main() -> None:
                         help="Print pot file stats and exit (no Discord)")
     parser.add_argument("--force-digest", action="store_true",
                         help="Send the daily digest immediately and exit")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Run one poll cycle but skip all Discord posts (log only)")
     args = parser.parse_args()
 
     if WPASEC_KEY == "YOUR_KEY_HERE":
@@ -528,21 +643,30 @@ def main() -> None:
         logger.info("Forcing daily digest...")
         try:
             raw = fetch_pot()
-            send_discord_daily_digest(parse_pot(raw))
+            state = load_state()
+            send_discord_daily_digest(parse_pot(raw), state.get("daily_crack_counts", {}))
             logger.info("Daily digest sent.")
         except Exception as exc:
             logger.error(f"ERROR: {exc}")
             sys.exit(1)
         sys.exit(0)
 
+    # One-shot modes: run without acquiring the daemon lock
+    if args.dry_run or args.once:
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+        logger.addHandler(sh)
+        if args.dry_run:
+            logger.info("DRY RUN — no Discord posts will be made.")
+            check(oui_db, dry_run=True)
+        else:
+            check(oui_db)
+        sys.exit(0)
+
     _acquire_instance_lock()
 
     logger.info(f"Starting wpa-sec notifier (polling every {POLL_INTERVAL // 60} minutes).")
     logger.info(f"Cache: {CACHE_FILE}  |  CSV: {CSV_FILE}  |  Log: {LOG_FILE}")
-
-    if args.once:
-        check(oui_db)
-        sys.exit(0)
 
     try:
         while True:
